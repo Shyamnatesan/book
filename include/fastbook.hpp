@@ -189,6 +189,7 @@ public:
 
   // On LevelsFull, PoolFull or QuantityOverflow the order may already have been partially
   // matched: order.quantity holds the unfilled remainder, which was not rested.
+  // on_trade runs in the middle of matching and must not call back into this book.
   template <typename F> AddResult AddOrder(Order &order, F &&on_trade) {
     AddResult result = AddResult::Duplicate;
     if (index_.Find(order.order_id) == nullptr) [[likely]] {
