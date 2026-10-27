@@ -18,7 +18,7 @@ export VFB_RUN=<short-task-name>     # groups evidence; default is a timestamp
 .claude/skills/verify-fastbook/scripts/vfb build
 ```
 
-Configures a Release build in `$VFB_ROOT/build` and builds `book_test`, `book_bench`, `book_demo`. Ready when it prints `[vfb] built: ...`. It reuses `build/_deps/benchmark-src` (google/benchmark v1.9.1) when present, so no network is needed; without it CMake's FetchContent clones from GitHub. Logs: `$VFB_ROOT/configure.log`, `$VFB_ROOT/build.log`. Re-run `build` after any edit to `include/`, `tests/`, `bench/`, `src/` or `CMakeLists.txt`. Scenarios (below) compile directly from `include/` and need no build step.
+Configures a Release build in `$VFB_ROOT/build` and builds `book_test`, `invariant_test`, `book_bench`, `book_demo`. Ready when it prints `[vfb] built: ...`. It reuses `build/_deps/benchmark-src` (google/benchmark v1.9.1) when present, so no network is needed; without it CMake's FetchContent clones from GitHub. Logs: `$VFB_ROOT/configure.log`, `$VFB_ROOT/build.log`. Re-run `build` after any edit to `include/`, `tests/`, `bench/`, `src/` or `CMakeLists.txt`. Scenarios (below) compile directly from `include/` and need no build step.
 
 ## Doctor
 
@@ -31,8 +31,8 @@ Read-only. Confirms g++ exists, the build dir was configured from *this* repo, t
 ## Drive
 
 - **Consumer scenario** (primary): `vfb scenario <file.cpp>`. Compiles a program against `include/` with asserts, ASan and UBSan on, runs it, and records the transcript. Ready-made scenarios live in `.claude/skills/verify-fastbook/scenarios/` (one per feature, see `features/`). For a new behaviour, copy the closest one to `$VFB_ROOT/scenarios/` (not into the repo) and edit it; `vfb scenario` puts both `include/` and the scenarios directory on the include path, so `#include "scenario.hpp"` works from anywhere. `Session<MaxLevels>` logs every `AddOrder`/`CancelOrder` call, its result, the remainder, each trade and the resulting top of book; `EXPECT(cond)` prints `ok`/`FAIL`; `Finish(name)` sets the exit code.
-- **Test suite**: `vfb test` runs `book_test` (prints `N/N tests passed`; exits non-zero on any failure).
-- **Benchmarks**: `vfb bench [regex]`, e.g. `vfb bench BM_Cancel`. Saves `bench.json`. Read the **Time** column (manual time), not CPU; `ops_total` must be ≥ 1,000,000 (see the header comment of `bench/book_bench.cpp`).
+- **Test suites**: `vfb test` runs `book_test` (behaviour) and `invariant_test` (the six book invariants after every operation, plus `CheckInvariants()`). Each prints `N/N tests passed` and exits non-zero on any failure.
+- **Benchmarks**: `vfb bench [regex]`, e.g. `vfb bench BM_CancelDeep`. Saves `bench.json`. Read the `ns_per_op` counter; `ops_total` must be ≥ 1,000,000 (see the header comment of `bench/book_bench.cpp`). For a before/after claim use `bench/compare.py OLD_BIN NEW_BIN --runs 7`, which interleaves the two binaries on one pinned core and only calls a difference when the ranges do not overlap.
 
 ## Evidence
 

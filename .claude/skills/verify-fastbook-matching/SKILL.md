@@ -60,10 +60,10 @@ It takes about 60 s and exits 0 only if every config prints `PASS`. Progress lin
 
 The harness reads these private members by name: `FastBook::{kNone, ladders_, nodes_, level_of_, free_node_, index_, stats_}`, `Ladder::{key, slot, levels, size, free_level}`, `Node::{next, prev, id, qty}`, and `OpenAddressingHashMap::{slots_, capacity_, size_, hash(), Slot::{k, v, state}}`. `FastBook` opens with an explicit `private:` so `#define private public` reaches its members.
 
-**Sync point:** confirmed against commit `d7a4ec2` plus the uncommitted FastBook rewrite working tree of 2026-10-27, with these header contents (first 12 hex digits of sha256):
+**Sync point:** confirmed against commit `1e1b85e`, with these header contents (first 12 hex digits of sha256):
 
 ```
-acbd4d3fe0f2 include/fastbook.hpp
+0059c59d8ae8 include/fastbook.hpp
 0d75095500a5 include/hashmap.hpp
 dd2e966c3bf2 include/order.hpp
 ```

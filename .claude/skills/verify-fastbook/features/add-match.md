@@ -22,7 +22,7 @@ Preconditions: none (scenario compiles from `include/`).
 - **Scenario.** Run `$H/scripts/vfb scenario $H/scenarios/match.cpp`. Exit `0`, last line `match: PASSED (0 failed)`, empty `scenario-match.err`.
 - **Time priority.** In `scenario-match.out` under `-- time priority inside a level`: `AddOrder(Buy id=6 price=101 qty=3)` produces `trade price=101 qty=2 taker=6 maker=4` then `trade price=101 qty=1 taker=6 maker=5`, and top becomes `ask 101 x 5`.
 - **Sweep.** Under `-- sweep across levels`: `AddOrder(Buy id=7 price=102 qty=12)` trades `101 x 5` then `102 x 4`, `remainder=3`, top becomes `bid 102 x 3 | ask 0 x 0`.
-- **Suite entry.** Run `$H/scripts/vfb test`. `book_test.out` ends with `22/22 tests passed` (count changes as tests are added; any `FAILED` line is a failure).
+- **Suite entry.** Run `$H/scripts/vfb test`. `book_test.out` and `invariant_test.out` each end with `N/N tests passed` (any `FAILED` line is a failure).
 
 ## Gotchas
 

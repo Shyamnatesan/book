@@ -3,9 +3,9 @@
 # under $VFB_ROOT (default ${TMPDIR:-/tmp}/verify-fastbook); the repo's own
 # build/ is never written to.
 #
-#   vfb build                 configure + build book_test/book_bench/book_demo (Release)
+#   vfb build                 configure + build book_test/invariant_test/book_bench/book_demo (Release)
 #   vfb doctor                read-only: is the build fresh and from this repo?
-#   vfb test                  run book_test
+#   vfb test                  run book_test and invariant_test
 #   vfb bench [filter]        run book_bench (optionally --benchmark_filter=<filter>), JSON saved
 #   vfb scenario <file.cpp>   compile a consumer program against include/ (asserts + ASan/UBSan) and run it
 #   vfb cleanup               remove the build dir and binaries; evidence is kept
@@ -41,7 +41,7 @@ build)
   fi
   cmake "${args[@]}" > "$root/configure.log" 2>&1 || { tail -20 "$root/configure.log"; exit 1; }
   cmake --build "$build" -j"$(nproc)" > "$root/build.log" 2>&1 || { grep -m20 -E 'error|Error' "$root/build.log"; exit 1; }
-  echo "[vfb] built: $build/{book_test,book_bench,book_demo}"
+  echo "[vfb] built: $build/{book_test,invariant_test,book_bench,book_demo}"
   ;;
 doctor)
   ok=1
@@ -52,7 +52,7 @@ doctor)
     src=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache")
     [[ "$src" == "$repo" ]] && echo "source: $src" || { echo "FAIL build is for $src, not $repo"; ok=0; }
     echo "build type: $(sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' "$cache")"
-    for b in book_test book_bench book_demo; do
+    for b in book_test invariant_test book_bench book_demo; do
       [[ -x "$build/$b" ]] || { echo "FAIL missing $build/$b"; ok=0; continue; }
       stale=$(find "$repo/include" "$repo/tests" "$repo/bench" "$repo/src" "$repo/CMakeLists.txt" -newer "$build/$b" -type f 2>/dev/null | head -3)
       [[ -z "$stale" ]] && echo "$b: fresh" || { echo "STALE $b older than: $stale (run: vfb build)"; ok=0; }
@@ -62,7 +62,7 @@ doctor)
   [[ $ok == 1 ]] && echo "doctor: OK" || { echo "doctor: NOT OK"; exit 1; }
   ;;
 test)
-  record book_test "$build/book_test"
+  record book_test "$build/book_test" && record invariant_test "$build/invariant_test"
   ;;
 bench)
   mkdir -p "$ev"
