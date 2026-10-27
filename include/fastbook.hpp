@@ -143,6 +143,10 @@ private:
     return side == Side::Buy ? price : ~price;
   }
 
+  // A ternary over constant indices keeps one ladder pointer live; indexing by a
+  // runtime side made GCC rebuild side * sizeof(Ladder) at each use and spill.
+  Ladder &LadderOf(Side side) { return side == Side::Buy ? ladders_[0] : ladders_[1]; }
+
   static Side Opposite(Side side) {
     return side == Side::Buy ? Side::Sell : Side::Buy;
   }
@@ -205,7 +209,7 @@ public:
     const uint16_t tag = level_of_[h];
     const Side side = static_cast<Side>(tag >> 15);
     const uint16_t slot = tag & 0x7FFF;
-    Ladder &ladder = ladders_[static_cast<size_t>(side)];
+    Ladder &ladder = LadderOf(side);
     PriceLevel &level = ladder.levels[slot];
 
     level.total_quantity -= nodes_[h].qty;
@@ -373,7 +377,7 @@ private:
 
   template <typename F> void Match(Order &taker, F &on_trade) {
     const Side maker_side = Opposite(taker.side);
-    Ladder &opposite = ladders_[static_cast<size_t>(maker_side)];
+    Ladder &opposite = LadderOf(maker_side);
     const int64_t limit = Key(maker_side, taker.price);
     while (taker.quantity > 0 && opposite.size > 0 &&
            limit <= opposite.key[opposite.size - 1]) {
@@ -405,7 +409,7 @@ private:
   }
 
   AddResult Rest(Order &order) {
-    Ladder &ladder = ladders_[static_cast<size_t>(order.side)];
+    Ladder &ladder = LadderOf(order.side);
     const int64_t key = Key(order.side, order.price);
     const uint32_t pos = ladder.LowerBound(key);
     const bool found = pos < ladder.size && ladder.key[pos] == key;
