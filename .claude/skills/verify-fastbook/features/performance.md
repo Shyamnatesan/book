@@ -13,6 +13,8 @@ FastBook exists to be fast on the hot path, with no allocation after constructio
 - `perf-random-cancel` `BM_CancelRandomId`: random 32-bit ids at random depths, 1 in 16 cancels misses.
 - `perf-clustered` `BM_ClusteredPrices`: mixed adds, takers and cancels within 5 ticks of mid.
 - `perf-offset-ids` `BM_CancelOffsetIds`: sequential ids from a second range next to the background's; guards against hash clustering.
+- `perf-large` `BM_Large_{AddAtBest,CancelBest,MatchTopOfBook,Sweep10Levels}`: the same four scenarios on a 500,000-order book (2,500 levels per side, 100 orders each). Seeded once per benchmark; `seed_ms` reports the seed time.
+- `perf-latency` `BM_Lat_*` and `BM_Lat_Large_*`: each operation timed on its own with fenced `rdpru` APERF reads (core cycles). Counters `p50_cyc/p99_cyc/p999_cyc`, the same in ns via the measured `ghz`, and `max_ns`; `ns_per_op` is the mean.
 
 ## How to get to it (user POV)
 
@@ -34,3 +36,6 @@ Preconditions: `$H/scripts/vfb build`, then `$H/scripts/vfb doctor` prints `doct
 - `***WARNING*** CPU scaling is enabled` means the governor is `schedutil`. Interleaved A/B with medians is required; a single run can be 15% off.
 - A Debug or stale build produces meaningless numbers; doctor catches both.
 - Uncommitted edits to `bench/book_bench.cpp` change the harness itself; rebuild both sides from the same bench source before comparing.
+- The bench source changes inlining. Adding instantiations once moved the baseline's AddAtBest 27% with unchanged headers. Compare only binaries built from the same bench source and flags.
+- The latency mode uses `rdpru`, which needs Zen 2 or later. The TSC on this CPU advances in 30-cycle steps, too coarse for 10 ns operations.
+- Large-book results depend on page size. `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` gives both sides transparent huge pages; report which setting you used.
