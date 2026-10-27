@@ -53,6 +53,9 @@ struct BookStats {
   uint64_t traded_quantity{};
 };
 
+// Hot-path helpers carry [[gnu::always_inline]] so their code does not depend on
+// the caller's inlining budget. Left to GCC, the same benchmarks ran up to 26%
+// slower in a translation unit with more instantiations of the book.
 template <typename Allocator, size_t MaxLevels> class FastBook {
 private:
   // level_of_ packs the side into bit 15 and the level slot into the rest.
@@ -79,7 +82,7 @@ private:
     uint32_t free_level; // free slots chain through PriceLevel::orders_head
 
     // First position whose key is >= k.
-    uint32_t LowerBound(int64_t k) const {
+    [[gnu::always_inline]] uint32_t LowerBound(int64_t k) const {
       if (size == 0 || k > key[size - 1]) {
         return size;
       }
@@ -99,7 +102,7 @@ private:
       return static_cast<uint32_t>(base - key) + (*base < k);
     }
 
-    uint16_t Insert(uint32_t pos, int64_t k, Price price) {
+    [[gnu::always_inline]] uint16_t Insert(uint32_t pos, int64_t k, Price price) {
       assert(size < MaxLevels && free_level != kNone && pos <= size);
       const auto s = static_cast<uint16_t>(free_level);
       free_level = levels[s].orders_head;
@@ -115,7 +118,7 @@ private:
       return s;
     }
 
-    void Erase(uint32_t pos) {
+    [[gnu::always_inline]] void Erase(uint32_t pos) {
       assert(pos < size);
       const uint16_t s = slot[pos];
       if (pos + 1 != size) {
@@ -127,7 +130,7 @@ private:
       free_level = s;
     }
 
-    const PriceLevel *Best() const {
+    [[gnu::always_inline]] const PriceLevel *Best() const {
       return size == 0 ? nullptr : &levels[slot[size - 1]];
     }
   };
@@ -139,13 +142,13 @@ private:
   // Slot is {u32 key, u32 handle, u8 state} = 12 B; keeps the table compact.
   static_assert(OrderIndex::kSlotSize == 12, "hash map Slot must be 12 bytes");
 
-  static int64_t Key(Side side, Price price) {
+  [[gnu::always_inline]] static int64_t Key(Side side, Price price) {
     return side == Side::Buy ? price : ~price;
   }
 
   // A ternary over constant indices keeps one ladder pointer live; indexing by a
   // runtime side made GCC rebuild side * sizeof(Ladder) at each use and spill.
-  Ladder &LadderOf(Side side) { return side == Side::Buy ? ladders_[0] : ladders_[1]; }
+  [[gnu::always_inline]] Ladder &LadderOf(Side side) { return side == Side::Buy ? ladders_[0] : ladders_[1]; }
 
   static Side Opposite(Side side) {
     return side == Side::Buy ? Side::Sell : Side::Buy;
@@ -189,7 +192,9 @@ public:
   template <typename F> AddResult AddOrder(Order &order, F &&on_trade) {
     AddResult result = AddResult::Duplicate;
     if (index_.Find(order.order_id) == nullptr) [[likely]] {
-      Match(order, on_trade);
+      if (Crosses(order)) [[unlikely]] {
+        Match(order, on_trade);
+      }
       result = order.quantity == 0 ? AddResult::Ok : Rest(order);
     }
     if (result == AddResult::Ok) [[likely]] {
@@ -200,7 +205,7 @@ public:
     return result;
   }
 
-  bool CancelOrder(OrderId order_id) {
+  [[gnu::always_inline]] bool CancelOrder(OrderId order_id) {
     const uint32_t *found = index_.Find(order_id);
     if (found == nullptr) {
       return false;
@@ -363,19 +368,27 @@ private:
     return best == nullptr ? 0 : best->total_quantity;
   }
 
-  void Unlink(PriceLevel &level, uint32_t h) {
+  [[gnu::always_inline]] void Unlink(PriceLevel &level, uint32_t h) {
     const Node &node = nodes_[h];
     (node.prev == kNone ? level.orders_head : nodes_[node.prev].next) = node.next;
     (node.next == kNone ? level.orders_tail : nodes_[node.next].prev) = node.prev;
     --level.order_count;
   }
 
-  void FreeNode(uint32_t h) {
+  [[gnu::always_inline]] void FreeNode(uint32_t h) {
     nodes_[h].next = free_node_;
     free_node_ = h;
   }
 
-  template <typename F> void Match(Order &taker, F &on_trade) {
+  [[gnu::always_inline]] bool Crosses(const Order &taker) {
+    const Side maker_side = Opposite(taker.side);
+    const Ladder &opposite = LadderOf(maker_side);
+    return opposite.size > 0 && Key(maker_side, taker.price) <= opposite.key[opposite.size - 1];
+  }
+
+  // Out of line, so a resting add does not carry the matching loop's register
+  // state; AddOrder calls it only when Crosses says the order trades.
+  template <typename F> [[gnu::noinline]] void Match(Order &taker, F &on_trade) {
     const Side maker_side = Opposite(taker.side);
     Ladder &opposite = LadderOf(maker_side);
     const int64_t limit = Key(maker_side, taker.price);
@@ -408,7 +421,7 @@ private:
     }
   }
 
-  AddResult Rest(Order &order) {
+  [[gnu::always_inline]] AddResult Rest(Order &order) {
     Ladder &ladder = LadderOf(order.side);
     const int64_t key = Key(order.side, order.price);
     const uint32_t pos = ladder.LowerBound(key);

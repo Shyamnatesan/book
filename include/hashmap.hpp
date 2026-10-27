@@ -94,7 +94,8 @@ private:
   ptr slots_{nullptr};
 
 public:
-  bool Insert(const K &k, V v) {
+  // always_inline on the hot calls: see the note above FastBook.
+  [[gnu::always_inline]] bool Insert(const K &k, V v) {
     if (size_ == capacity_) {
       return false;
     }
@@ -120,11 +121,11 @@ public:
     return true;
   }
 
-  V *Find(const K &k) {
+  [[gnu::always_inline]] V *Find(const K &k) {
     return const_cast<V *>(std::as_const(*this).Find(k));
   }
 
-  const V *Find(const K &k) const {
+  [[gnu::always_inline]] const V *Find(const K &k) const {
     if (size_ == 0) {
       return nullptr;
     }
@@ -140,7 +141,7 @@ public:
 
   // Backward-shift deletion: no tombstones. Pointers returned by Find are
   // invalidated by an Erase of a different key (entries may be moved).
-  bool Erase(const K &k) {
+  [[gnu::always_inline]] bool Erase(const K &k) {
     if (size_ == 0) {
       return false;
     }
@@ -178,9 +179,9 @@ private:
     return capacity;
   }
 
-  size_t hash(const K &k) const { return Hash{}(k, bits_); }
+  [[gnu::always_inline]] size_t hash(const K &k) const { return Hash{}(k, bits_); }
 
-  size_t Probe(const K &k) const {
+  [[gnu::always_inline]] size_t Probe(const K &k) const {
     size_t idx = hash(k);
     size_t start = idx;
     for (;;) {
