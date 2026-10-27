@@ -5,6 +5,7 @@
 #include <cassert>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 
@@ -17,9 +18,8 @@ template <typename K, typename V, typename Allocator = std::allocator<K>>
            std::assignable_from<V &, const V &>
 class OpenAddressingHashMap {
 
-  enum class SlotState {
+  enum class SlotState : uint8_t {
     Live,
-    Dead,
     Empty,
   };
 
@@ -37,14 +37,14 @@ class OpenAddressingHashMap {
   using ptr = typename SlotTraits::pointer;
 
 public:
+  static constexpr size_t kSlotSize = sizeof(Slot);
+
   explicit OpenAddressingHashMap(size_t capacity,
                                  const Allocator &alloc = Allocator())
       : alloc_(alloc), capacity_(check_capacity(capacity)) {
     slots_ = SlotTraits::allocate(alloc_, capacity_);
-    other_ = SlotTraits::allocate(alloc_, capacity_);
     for (size_t i{}; i < capacity_; ++i) {
       SlotTraits::construct(alloc_, slots_ + i);
-      SlotTraits::construct(alloc_, other_ + i);
     }
   }
 
@@ -55,11 +55,9 @@ public:
 
     for (size_t i{}; i < capacity_; ++i) {
       SlotTraits::destroy(alloc_, slots_ + i);
-      SlotTraits::destroy(alloc_, other_ + i);
     }
 
     SlotTraits::deallocate(alloc_, slots_, capacity_);
-    SlotTraits::deallocate(alloc_, other_, capacity_);
   }
 
   OpenAddressingHashMap(const OpenAddressingHashMap &) = delete;
@@ -72,10 +70,8 @@ private:
   [[no_unique_address]] SlotAlloc alloc_{};
   size_t capacity_;
   size_t size_{};
-  size_t dead_{};
 
   ptr slots_{nullptr};
-  ptr other_{nullptr};
 
 public:
   bool Insert(const K &k, V v) {
@@ -83,42 +79,19 @@ public:
       return false;
     }
 
-    if (dead_ > size_) {
-      rehash();
-    }
-
     size_t idx = hash(k);
-    size_t start = idx;
-    size_t first_dead_idx = capacity_;
 
+    // size_ < capacity_ here, so an Empty slot always exists on the probe path.
     for (;;) {
       if ((slots_ + idx)->state == SlotState::Empty) {
         break;
       }
-      if ((slots_ + idx)->state == SlotState::Live && (slots_ + idx)->k == k) {
+      if ((slots_ + idx)->k == k) {
         // key already exists
         (slots_ + idx)->v = v;
         return true;
       }
-      if ((slots_ + idx)->state == SlotState::Dead &&
-          first_dead_idx == capacity_) {
-        first_dead_idx = idx;
-      }
       idx = (idx + 1) & (capacity_ - 1);
-      if (idx == start) {
-        if (first_dead_idx == capacity_) {
-          return false;
-        }
-        break;
-      }
-    }
-    // now we have found a slot to insert, this is either a dead slot or an
-    // empty slot.
-    //
-    // if we have moved past a dead slot, we use that.
-    if (first_dead_idx != capacity_) {
-      idx = first_dead_idx;
-      --dead_;
     }
     (slots_ + idx)->k = k;
     (slots_ + idx)->v = v;
@@ -139,18 +112,34 @@ public:
     return &(slots_ + static_cast<size_t>(idx))->v;
   }
 
+  // Backward-shift deletion: no tombstones. Pointers returned by Find are
+  // invalidated by an Erase of a different key (entries may be moved).
   bool Erase(const K &k) {
     if (size_ == 0) {
       return false;
     }
-    auto idx = Probe(k);
-    if (idx == capacity_ || (slots_ + idx)->state == SlotState::Empty) {
+    size_t i = Probe(k);
+    if (i == capacity_ || (slots_ + i)->state == SlotState::Empty) {
       return false;
     }
-
-    (slots_ + static_cast<size_t>(idx))->state = SlotState::Dead;
+    const size_t mask = capacity_ - 1;
+    size_t j = i;
+    // The step bound guards a completely full table, which has no Empty slot.
+    for (size_t steps = 1; steps < capacity_; ++steps) {
+      j = (j + 1) & mask;
+      if ((slots_ + j)->state == SlotState::Empty) {
+        break;
+      }
+      const size_t h = hash((slots_ + j)->k);
+      // Slot j may fill hole i iff its home h is not cyclically in (i, j].
+      if (((j - h) & mask) >= ((j - i) & mask)) {
+        (slots_ + i)->k = (slots_ + j)->k;
+        (slots_ + i)->v = (slots_ + j)->v;
+        i = j;
+      }
+    }
+    (slots_ + i)->state = SlotState::Empty;
     --size_;
-    ++dead_;
     return true;
   }
 
@@ -179,7 +168,7 @@ private:
         break;
       }
       // break early if we find a live slot + matching key
-      if ((slots_ + idx)->state == SlotState::Live && (slots_ + idx)->k == k) {
+      if ((slots_ + idx)->k == k) {
         break;
       }
       idx = (idx + 1) & (capacity_ - 1);
@@ -188,34 +177,6 @@ private:
       }
     }
     return idx;
-  }
-
-  void rehash() {
-    // other_ must start fully Empty. Clear it first.
-    for (size_t i = 0; i < capacity_; ++i) {
-      (other_ + i)->state = SlotState::Empty;
-    }
-
-    size_t moved = 0;
-    for (size_t i = 0; i < capacity_; ++i) {
-      if ((slots_ + i)->state != SlotState::Live) {
-        continue;
-      }
-      size_t idx = hash((slots_ + i)->k);
-      size_t probes = 0;
-      while ((other_ + idx)->state == SlotState::Live) {
-        idx = (idx + 1) & (capacity_ - 1);
-        assert(++probes < capacity_ && "rehash: other_ overfull");
-      }
-      (other_ + idx)->k = (slots_ + i)->k;
-      (other_ + idx)->v = (slots_ + i)->v;
-      (other_ + idx)->state = SlotState::Live;
-      ++moved;
-    }
-
-    std::swap(slots_, other_);
-    dead_ = 0;
-    assert(moved == size_);
   }
 };
 

@@ -8,15 +8,24 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <limits>
 
 #include <cstring>
 
 namespace shyamnatesan {
 
+enum class AddResult { Ok, Duplicate, LevelsFull, PoolFull, QuantityOverflow };
+
 template <typename Allocator, size_t MaxLevels> class FastBook {
 public:
   explicit FastBook(size_t max_orders, Allocator alloc)
-      : order_table_(max_orders * 2, alloc), orders_(max_orders, alloc) {}
+      : order_table_(max_orders * 2, alloc), orders_(max_orders, alloc) {
+    // Every pool handle must fit in OrderHandle without colliding with the
+    // kInvalidPoolIndex sentinel.
+    if (max_orders >= kInvalidPoolIndex) {
+      throw std::invalid_argument("max_orders must be < kInvalidPoolIndex");
+    }
+  }
 
 private:
   struct OrderNode {
@@ -27,11 +36,14 @@ private:
     OrderNode(const Order &o) : order(o) {}
   };
 
-  using OrderHandle = size_t;
+  using OrderHandle = uint32_t;
 
   using Levels = InlineBuffer<PriceLevel, MaxLevels>;
   using OrderTable = OpenAddressingHashMap<OrderId, OrderHandle, Allocator>;
   using OrderPool = MemPool<OrderNode, Allocator>;
+
+  // Slot is {u32 key, u32 handle, u8 state} = 12 B; keeps the table compact.
+  static_assert(OrderTable::kSlotSize == 12, "hash map Slot must be 12 bytes");
 
   Levels bids_{};
   Levels asks_{};
@@ -40,17 +52,19 @@ private:
   OrderPool orders_;
 
 public:
-  template <typename F> void AddOrder(Order &order, F &&on_trade) {
+  // On LevelsFull, PoolFull or QuantityOverflow the order may already have been partially
+  // matched: order.quantity holds the unfilled remainder, which was not rested.
+  template <typename F> AddResult AddOrder(Order &order, F &&on_trade) {
     if (order_table_.Find(order.order_id) != nullptr) [[unlikely]] {
-      return;
+      return AddResult::Duplicate;
     }
 
     Match(order, on_trade);
     if (order.quantity == 0) [[unlikely]] {
-      return;
+      return AddResult::Ok;
     }
 
-    AddInBook(order);
+    return AddInBook(order);
   }
 
   Price BestBid() const { return bids_.empty() ? 0 : bids_.back().price; }
@@ -116,7 +130,7 @@ private:
       PriceLevel &level = opposite.back();
 
       while (incoming.quantity > 0 && level.orders_head != kInvalidPoolIndex) {
-        const size_t head = level.orders_head;
+        const OrderHandle head = level.orders_head;
         OrderNode *resting = orders_.Get(head);
 
         const Quantity fill =
@@ -148,7 +162,7 @@ private:
     }
   }
 
-  void AddInBook(Order &order) {
+  AddResult AddInBook(Order &order) {
     // get the appropriate level
     Levels &levels = (order.side == Side::Buy) ? bids_ : asks_;
 
@@ -162,17 +176,35 @@ private:
     const bool found =
         level_idx < levels.size() && levels[level_idx].price == order.price;
 
+    // reject before allocating or mutating anything
+    if (!found && levels.size() == MaxLevels) [[unlikely]] {
+      return AddResult::LevelsFull;
+    }
+
+    // reject if the level aggregate would wrap; the new-level path starts
+    // from a single Quantity and cannot overflow
+    if (found && levels[level_idx].total_quantity >
+                     std::numeric_limits<Quantity>::max() - order.quantity)
+        [[unlikely]] {
+      return AddResult::QuantityOverflow;
+    }
+
     // create a new order in the pool
-    const size_t new_order_handle = orders_.Allocate(order);
-    assert(new_order_handle != kInvalidPoolIndex);
+    const OrderHandle new_order_handle =
+        static_cast<OrderHandle>(orders_.Allocate(order));
+    if (new_order_handle == kInvalidPoolIndex) [[unlikely]] {
+      return AddResult::PoolFull;
+    }
     OrderNode *new_order = orders_.Get(new_order_handle);
 
     if (!found) [[unlikely]] {
       levels.emplace_at(level_idx, order.price, order.quantity, 1,
                         new_order_handle, new_order_handle);
 
-      order_table_.Insert(new_order->order.order_id, new_order_handle);
-      return;
+      [[maybe_unused]] const bool inserted =
+          order_table_.Insert(new_order->order.order_id, new_order_handle);
+      assert(inserted);
+      return AddResult::Ok;
     }
 
     const auto curr_tail_handle = levels[level_idx].orders_tail;
@@ -183,8 +215,10 @@ private:
     levels[level_idx].total_quantity += order.quantity;
     ++levels[level_idx].order_count;
 
-    order_table_.Insert(new_order->order.order_id, new_order_handle);
-    return;
+    [[maybe_unused]] const bool inserted =
+        order_table_.Insert(new_order->order.order_id, new_order_handle);
+    assert(inserted);
+    return AddResult::Ok;
   }
 };
 

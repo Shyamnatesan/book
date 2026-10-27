@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Drive FastBook the way a consumer does. Everything this script creates lives
+# under $VFB_ROOT (default ${TMPDIR:-/tmp}/verify-fastbook); the repo's own
+# build/ is never written to.
+#
+#   vfb build                 configure + build book_test/book_bench/book_demo (Release)
+#   vfb doctor                read-only: is the build fresh and from this repo?
+#   vfb test                  run book_test
+#   vfb bench [filter]        run book_bench (optionally --benchmark_filter=<filter>), JSON saved
+#   vfb scenario <file.cpp>   compile a consumer program against include/ (asserts + ASan/UBSan) and run it
+#   vfb cleanup               remove the build dir and binaries; evidence is kept
+#
+# Evidence for each command goes to $VFB_ROOT/evidence/$VFB_RUN/<name>.{cmd,out,err,exit}.
+set -uo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+repo="$(cd "$here/../../../.." && pwd)"
+root="${VFB_ROOT:-${TMPDIR:-/tmp}/verify-fastbook}"
+run="${VFB_RUN:-$(date +%Y%m%d-%H%M%S)}"
+build="$root/build"
+ev="$root/evidence/$run"
+
+record() { # record <name> <cmd...>: run, tee output, save cmd/out/err/exit
+  local name="$1"; shift
+  mkdir -p "$ev"
+  printf '%q ' "$@" > "$ev/$name.cmd"; echo >> "$ev/$name.cmd"
+  "$@" > >(tee "$ev/$name.out") 2> >(tee "$ev/$name.err" >&2)
+  local rc=$?
+  echo "$rc" > "$ev/$name.exit"
+  echo "[vfb] $name exit=$rc evidence=$ev/$name.*" >&2
+  return $rc
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+build)
+  mkdir -p "$build"
+  args=(-S "$repo" -B "$build" -DCMAKE_BUILD_TYPE=Release)
+  # Reuse the repo's already-fetched google/benchmark so no network is needed.
+  if [[ -d "$repo/build/_deps/benchmark-src" ]]; then
+    args+=(-DFETCHCONTENT_SOURCE_DIR_BENCHMARK="$repo/build/_deps/benchmark-src" -DFETCHCONTENT_FULLY_DISCONNECTED=ON)
+  fi
+  cmake "${args[@]}" > "$root/configure.log" 2>&1 || { tail -20 "$root/configure.log"; exit 1; }
+  cmake --build "$build" -j"$(nproc)" > "$root/build.log" 2>&1 || { grep -m20 -E 'error|Error' "$root/build.log"; exit 1; }
+  echo "[vfb] built: $build/{book_test,book_bench,book_demo}"
+  ;;
+doctor)
+  ok=1
+  command -v g++ >/dev/null && echo "g++: $(g++ -dumpfullversion)" || { echo "FAIL g++ missing"; ok=0; }
+  cache="$build/CMakeCache.txt"
+  if [[ ! -f "$cache" ]]; then echo "FAIL no build at $build (run: vfb build)"; ok=0
+  else
+    src=$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache")
+    [[ "$src" == "$repo" ]] && echo "source: $src" || { echo "FAIL build is for $src, not $repo"; ok=0; }
+    echo "build type: $(sed -n 's/^CMAKE_BUILD_TYPE:STRING=//p' "$cache")"
+    for b in book_test book_bench book_demo; do
+      [[ -x "$build/$b" ]] || { echo "FAIL missing $build/$b"; ok=0; continue; }
+      stale=$(find "$repo/include" "$repo/tests" "$repo/bench" "$repo/src" "$repo/CMakeLists.txt" -newer "$build/$b" -type f 2>/dev/null | head -3)
+      [[ -z "$stale" ]] && echo "$b: fresh" || { echo "STALE $b older than: $stale (run: vfb build)"; ok=0; }
+    done
+  fi
+  echo "evidence root: $root/evidence"
+  [[ $ok == 1 ]] && echo "doctor: OK" || { echo "doctor: NOT OK"; exit 1; }
+  ;;
+test)
+  record book_test "$build/book_test"
+  ;;
+bench)
+  mkdir -p "$ev"
+  a=("$build/book_bench" --benchmark_out="$ev/bench.json" --benchmark_out_format=json)
+  [[ -n "${1:-}" ]] && a+=(--benchmark_filter="$1")
+  record bench "${a[@]}"
+  ;;
+scenario)
+  f="${1:?usage: vfb scenario <file.cpp>}"
+  name="scenario-$(basename "$f" .cpp)"
+  mkdir -p "$ev"
+  bin="$root/bin/$name"; mkdir -p "$root/bin"
+  # Consumer build: public headers only, asserts on, sanitizers on.
+  record "$name.compile" g++ -std=c++23 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I"$repo/include" -I"$here/../scenarios" "$f" -o "$bin" || exit 1
+  record "$name" "$bin"
+  ;;
+cleanup)
+  rm -rf "$build" "$root/bin" "$root/configure.log" "$root/build.log"
+  echo "[vfb] removed build + binaries; evidence kept in $root/evidence"
+  ;;
+*)
+  sed -n '2,15p' "$0"; exit 2 ;;
+esac
