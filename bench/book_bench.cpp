@@ -28,6 +28,10 @@
 #include <unordered_set>
 #include <vector>
 
+#if !defined(__x86_64__)
+#error "book_bench times operations with x86-64 cycle counters"
+#endif
+#include <cpuid.h>
 #include <x86intrin.h>
 
 using namespace shyamnatesan;
@@ -119,10 +123,24 @@ template <class B> [[gnu::noinline]] uint64_t TimedCancels(B &b, const std::vect
 // coarse for 10 ns operations, so this reads APERF (actual core cycles, one
 // cycle resolution) with rdpru. lfence before keeps earlier work out of the
 // sample; lfence after keeps later work from starting before the read.
+// Without rdpru (Intel, pre-Zen 2 AMD, some VMs) it falls back to the TSC.
+bool HasRdpru() {
+  unsigned a, b, c, d;
+  return __get_cpuid(0x80000008, &a, &b, &c, &d) && (b & (1u << 4)) != 0;
+}
+
+const bool kHasRdpru = HasRdpru();
+
 [[gnu::always_inline]] inline uint64_t FencedCycles() {
   uint32_t lo, hi;
   _mm_lfence();
-  asm volatile("rdpru" : "=a"(lo), "=d"(hi) : "c"(1));
+  if (kHasRdpru) {
+    asm volatile("rdpru" : "=a"(lo), "=d"(hi) : "c"(1));
+  } else {
+    const uint64_t t = __rdtsc();
+    lo = static_cast<uint32_t>(t);
+    hi = static_cast<uint32_t>(t >> 32);
+  }
   _mm_lfence();
   return (uint64_t{hi} << 32) | lo;
 }
@@ -273,6 +291,7 @@ template <class S = Small> struct Fixture {
         }
         state.counters["max_ns"] = lat.Ns(*std::max_element(lat.cycles.begin(), lat.cycles.end()));
         state.counters["ghz"] = Calibration().cycles_per_ns;
+        state.counters["rdpru"] = kHasRdpru;
       }
     }
     if (!err.empty()) state.SkipWithError(err.c_str());
