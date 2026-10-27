@@ -36,6 +36,7 @@ struct PriceLevel {
   uint32_t orders_head;
   uint32_t orders_tail;
 };
+static_assert(sizeof(PriceLevel) == 24);
 
 } // namespace V1
 

@@ -22,17 +22,21 @@ target_include_directories(book INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 add_executable(book_demo src/demo.cpp)
 target_link_libraries(book_demo PRIVATE book)
 
-add_executable(book_test test/book_test.cpp)
+add_executable(book_test tests/book_test.cpp)
 target_link_libraries(book_test PRIVATE book)
+
+add_executable(invariant_test tests/invariant_test.cpp)
+target_link_libraries(invariant_test PRIVATE book)
 
 add_executable(book_bench bench/book_bench.cpp)
 target_link_libraries(book_bench PRIVATE book benchmark::benchmark)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-  foreach(target book_demo book_test book_bench)
+  foreach(target book_demo book_test invariant_test book_bench)
     target_compile_options(${target} PRIVATE -O3 -march=native)
   endforeach()
 endif()
 
 enable_testing()
 add_test(NAME book_test COMMAND book_test)
+add_test(NAME invariant_test COMMAND invariant_test)

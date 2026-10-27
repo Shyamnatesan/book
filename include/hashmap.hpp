@@ -2,24 +2,42 @@
 
 #pragma once
 
+#include <bit>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 namespace shyamnatesan {
 
-template <typename K, typename V, typename Allocator = std::allocator<K>>
+// A hash maps a key to its home slot in a table of 2^bits slots.
+struct MaskHash {
+  template <typename K> size_t operator()(const K &k, unsigned bits) const {
+    return static_cast<size_t>(k) & ((size_t{1} << bits) - 1);
+  }
+};
+
+// Multiplicative hashing keeps the top bits of k * 2^32/phi, so ids that share
+// their low bits (strided sequences) still spread across the table.
+struct FibonacciHash {
+  size_t operator()(uint32_t k, unsigned bits) const {
+    return static_cast<size_t>((uint64_t{k * 0x9E3779B9u} << bits) >> 32);
+  }
+};
+
+template <typename K, typename V, typename Allocator = std::allocator<K>,
+          typename Hash = MaskHash>
   requires std::default_initializable<K> && std::copy_constructible<K> &&
            std::assignable_from<K &, const K &> &&
            std::equality_comparable<K> && std::default_initializable<V> &&
            std::assignable_from<V &, const V &>
 class OpenAddressingHashMap {
 
-  enum class SlotState {
+  enum class SlotState : uint8_t {
     Live,
-    Dead,
     Empty,
   };
 
@@ -37,14 +55,15 @@ class OpenAddressingHashMap {
   using ptr = typename SlotTraits::pointer;
 
 public:
+  static constexpr size_t kSlotSize = sizeof(Slot);
+
   explicit OpenAddressingHashMap(size_t capacity,
                                  const Allocator &alloc = Allocator())
-      : alloc_(alloc), capacity_(check_capacity(capacity)) {
+      : alloc_(alloc), capacity_(check_capacity(capacity)),
+        bits_(static_cast<unsigned>(std::countr_zero(capacity))) {
     slots_ = SlotTraits::allocate(alloc_, capacity_);
-    other_ = SlotTraits::allocate(alloc_, capacity_);
     for (size_t i{}; i < capacity_; ++i) {
       SlotTraits::construct(alloc_, slots_ + i);
-      SlotTraits::construct(alloc_, other_ + i);
     }
   }
 
@@ -55,11 +74,9 @@ public:
 
     for (size_t i{}; i < capacity_; ++i) {
       SlotTraits::destroy(alloc_, slots_ + i);
-      SlotTraits::destroy(alloc_, other_ + i);
     }
 
     SlotTraits::deallocate(alloc_, slots_, capacity_);
-    SlotTraits::deallocate(alloc_, other_, capacity_);
   }
 
   OpenAddressingHashMap(const OpenAddressingHashMap &) = delete;
@@ -71,54 +88,31 @@ public:
 private:
   [[no_unique_address]] SlotAlloc alloc_{};
   size_t capacity_;
+  unsigned bits_;
   size_t size_{};
-  size_t dead_{};
 
   ptr slots_{nullptr};
-  ptr other_{nullptr};
 
 public:
-  bool Insert(const K &k, V v) {
+  // always_inline on the hot calls: see the note above FastBook.
+  [[gnu::always_inline]] bool Insert(const K &k, V v) {
     if (size_ == capacity_) {
       return false;
     }
 
-    if (dead_ > size_) {
-      rehash();
-    }
-
     size_t idx = hash(k);
-    size_t start = idx;
-    size_t first_dead_idx = capacity_;
 
+    // size_ < capacity_ here, so an Empty slot always exists on the probe path.
     for (;;) {
       if ((slots_ + idx)->state == SlotState::Empty) {
         break;
       }
-      if ((slots_ + idx)->state == SlotState::Live && (slots_ + idx)->k == k) {
+      if ((slots_ + idx)->k == k) {
         // key already exists
         (slots_ + idx)->v = v;
         return true;
       }
-      if ((slots_ + idx)->state == SlotState::Dead &&
-          first_dead_idx == capacity_) {
-        first_dead_idx = idx;
-      }
       idx = (idx + 1) & (capacity_ - 1);
-      if (idx == start) {
-        if (first_dead_idx == capacity_) {
-          return false;
-        }
-        break;
-      }
-    }
-    // now we have found a slot to insert, this is either a dead slot or an
-    // empty slot.
-    //
-    // if we have moved past a dead slot, we use that.
-    if (first_dead_idx != capacity_) {
-      idx = first_dead_idx;
-      --dead_;
     }
     (slots_ + idx)->k = k;
     (slots_ + idx)->v = v;
@@ -127,7 +121,11 @@ public:
     return true;
   }
 
-  V *Find(const K &k) {
+  [[gnu::always_inline]] V *Find(const K &k) {
+    return const_cast<V *>(std::as_const(*this).Find(k));
+  }
+
+  [[gnu::always_inline]] const V *Find(const K &k) const {
     if (size_ == 0) {
       return nullptr;
     }
@@ -139,22 +137,47 @@ public:
     return &(slots_ + static_cast<size_t>(idx))->v;
   }
 
-  bool Erase(const K &k) {
+  size_t Size() const { return size_; }
+
+  // Backward-shift deletion: no tombstones. Pointers returned by Find are
+  // invalidated by an Erase of a different key (entries may be moved).
+  [[gnu::always_inline]] bool Erase(const K &k) {
     if (size_ == 0) {
       return false;
     }
-    auto idx = Probe(k);
-    if (idx == capacity_ || (slots_ + idx)->state == SlotState::Empty) {
+    size_t i = Probe(k);
+    if (i == capacity_ || (slots_ + i)->state == SlotState::Empty) {
       return false;
     }
-
-    (slots_ + static_cast<size_t>(idx))->state = SlotState::Dead;
+    // A table with a free slot always ends the walk at an Empty slot; only a
+    // completely full one needs the step bound.
+    i = size_ < capacity_ ? ShiftBack<false>(i) : ShiftBack<true>(i);
+    (slots_ + i)->state = SlotState::Empty;
     --size_;
-    ++dead_;
     return true;
   }
 
 private:
+  // Backward-shift from hole i; returns the final hole.
+  template <bool Bounded> [[gnu::always_inline]] size_t ShiftBack(size_t i) {
+    const size_t mask = capacity_ - 1;
+    size_t j = i;
+    for (size_t steps = 1; !Bounded || steps < capacity_; ++steps) {
+      j = (j + 1) & mask;
+      if ((slots_ + j)->state == SlotState::Empty) {
+        break;
+      }
+      const size_t h = hash((slots_ + j)->k);
+      // Slot j may fill hole i iff its home h is not cyclically in (i, j].
+      if (((j - h) & mask) >= ((j - i) & mask)) {
+        (slots_ + i)->k = (slots_ + j)->k;
+        (slots_ + i)->v = (slots_ + j)->v;
+        i = j;
+      }
+    }
+    return i;
+  }
+
   static size_t check_capacity(size_t capacity) {
     if (capacity == 0 || (capacity & (capacity - 1)) != 0) {
       throw std::invalid_argument("capacity must be a non-zero power of two");
@@ -163,11 +186,9 @@ private:
     return capacity;
   }
 
-  size_t hash(const K &k) const {
-    return static_cast<size_t>(k) & (capacity_ - 1);
-  }
+  [[gnu::always_inline]] size_t hash(const K &k) const { return Hash{}(k, bits_); }
 
-  size_t Probe(const K &k) const {
+  [[gnu::always_inline]] size_t Probe(const K &k) const {
     size_t idx = hash(k);
     size_t start = idx;
     for (;;) {
@@ -179,7 +200,7 @@ private:
         break;
       }
       // break early if we find a live slot + matching key
-      if ((slots_ + idx)->state == SlotState::Live && (slots_ + idx)->k == k) {
+      if ((slots_ + idx)->k == k) {
         break;
       }
       idx = (idx + 1) & (capacity_ - 1);
@@ -188,34 +209,6 @@ private:
       }
     }
     return idx;
-  }
-
-  void rehash() {
-    // other_ must start fully Empty. Clear it first.
-    for (size_t i = 0; i < capacity_; ++i) {
-      (other_ + i)->state = SlotState::Empty;
-    }
-
-    size_t moved = 0;
-    for (size_t i = 0; i < capacity_; ++i) {
-      if ((slots_ + i)->state != SlotState::Live) {
-        continue;
-      }
-      size_t idx = hash((slots_ + i)->k);
-      size_t probes = 0;
-      while ((other_ + idx)->state == SlotState::Live) {
-        idx = (idx + 1) & (capacity_ - 1);
-        assert(++probes < capacity_ && "rehash: other_ overfull");
-      }
-      (other_ + idx)->k = (slots_ + i)->k;
-      (other_ + idx)->v = (slots_ + i)->v;
-      (other_ + idx)->state = SlotState::Live;
-      ++moved;
-    }
-
-    std::swap(slots_, other_);
-    dead_ = 0;
-    assert(moved == size_);
   }
 };
 
