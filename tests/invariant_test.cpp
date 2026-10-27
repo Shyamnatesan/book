@@ -314,7 +314,8 @@ void StatsCountEvents() {
   const BookStats &s = book.Stats();
   CHECK(s.trades == 1 && s.traded_quantity == 2);
   CHECK(s.cancels == 1);
-  CHECK(s.rejects[static_cast<size_t>(AddResult::Duplicate)] == 1);
+  CHECK(s.add_results[static_cast<size_t>(AddResult::Duplicate)] == 1);
+  CHECK(s.add_results[static_cast<size_t>(AddResult::Ok)] == 2);
   CHECK(std::string(ToString(AddResult::PoolFull)) == "PoolFull");
 }
 
