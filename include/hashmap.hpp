@@ -149,10 +149,20 @@ public:
     if (i == capacity_ || (slots_ + i)->state == SlotState::Empty) {
       return false;
     }
+    // A table with a free slot always ends the walk at an Empty slot; only a
+    // completely full one needs the step bound.
+    i = size_ < capacity_ ? ShiftBack<false>(i) : ShiftBack<true>(i);
+    (slots_ + i)->state = SlotState::Empty;
+    --size_;
+    return true;
+  }
+
+private:
+  // Backward-shift from hole i; returns the final hole.
+  template <bool Bounded> [[gnu::always_inline]] size_t ShiftBack(size_t i) {
     const size_t mask = capacity_ - 1;
     size_t j = i;
-    // The step bound guards a completely full table, which has no Empty slot.
-    for (size_t steps = 1; steps < capacity_; ++steps) {
+    for (size_t steps = 1; !Bounded || steps < capacity_; ++steps) {
       j = (j + 1) & mask;
       if ((slots_ + j)->state == SlotState::Empty) {
         break;
@@ -165,12 +175,9 @@ public:
         i = j;
       }
     }
-    (slots_ + i)->state = SlotState::Empty;
-    --size_;
-    return true;
+    return i;
   }
 
-private:
   static size_t check_capacity(size_t capacity) {
     if (capacity == 0 || (capacity & (capacity - 1)) != 0) {
       throw std::invalid_argument("capacity must be a non-zero power of two");

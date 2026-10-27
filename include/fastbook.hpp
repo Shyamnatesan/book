@@ -411,7 +411,10 @@ private:
         if (maker.qty != 0) {
           break;
         }
-        Unlink(level, h);
+        // The filled maker is the level's head, so only its successor needs relinking.
+        level.orders_head = maker.next;
+        (maker.next == kNone ? level.orders_tail : nodes_[maker.next].prev) = kNone;
+        --level.order_count;
         index_.Erase(maker.id);
         FreeNode(h);
       }
