@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One hillclimb attempt: gate the working tree, then A/B its bench against a
-# kept binary. Usage: bench/attempt.sh <kept_bench_binary> [runs] [filter]
+# kept binary. Usage: [BENCHMARK_SRC=dir] bench/attempt.sh <kept_bench_binary> [runs] [filter]
 # Leaves the candidate binary at $OUT/candidate_bench.
 set -euo pipefail
 repo="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,9 +9,10 @@ OUT="${OUT:-/tmp/fb-rw}"
 build="$OUT/new"
 cd "$repo"
 
+# BENCHMARK_SRC: an existing google/benchmark checkout, so the build needs no network.
 cmake -S . -B "$build" -DCMAKE_BUILD_TYPE=Release \
-  -DFETCHCONTENT_SOURCE_DIR_BENCHMARK=/home/shyam/Desktop/dev/book/build/_deps/benchmark-src \
-  -DFETCHCONTENT_FULLY_DISCONNECTED=ON > "$OUT/attempt-cmake.log"
+  ${BENCHMARK_SRC:+-DFETCHCONTENT_SOURCE_DIR_BENCHMARK="$BENCHMARK_SRC" -DFETCHCONTENT_FULLY_DISCONNECTED=ON} \
+  > "$OUT/attempt-cmake.log"
 cmake --build "$build" -j"$(nproc)" 2>&1 | grep -iE "warning|error" && exit 1
 (cd "$build" && ctest --output-on-failure > "$OUT/attempt-ctest.log") || { cat "$OUT/attempt-ctest.log"; exit 1; }
 for t in book_test invariant_test; do
