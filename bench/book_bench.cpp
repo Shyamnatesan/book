@@ -131,6 +131,16 @@ uint64_t CancelAll(Book &b, const std::vector<OrderId> &ids) {
   return hits;
 }
 
+// Timed batches go through these noinline copies so perf can tell the timed
+// path from the untimed seed and restore phases.
+[[gnu::noinline]] uint64_t TimedAdds(Book &b, const std::vector<Order> &orders) {
+  return AddAll(b, orders);
+}
+
+[[gnu::noinline]] uint64_t TimedCancels(Book &b, const std::vector<OrderId> &ids) {
+  return CancelAll(b, ids);
+}
+
 std::vector<OrderId> IdsOf(const std::vector<Order> &orders) {
   std::vector<OrderId> ids;
   for (const Order &o : orders) ids.push_back(o.order_id);
@@ -153,7 +163,7 @@ template <class DepthFn> void RunRestingAdd(benchmark::State &state, Ladder ladd
   size_t it = 0;
   for (auto _ : state) {
     const auto &batch = ring[it++ % kRing];
-    f.Timed(state, kOps, [&] { trades += AddAll(*f.book, batch); });
+    f.Timed(state, kOps, [&] { trades += TimedAdds(*f.book, batch); });
     hits += CancelAll(*f.book, ids);
   }
   f.Finish(state, trades != 0 ? "resting add traded"
@@ -210,7 +220,7 @@ void RunCancel(benchmark::State &state, DepthFn depth, bool random_ids, size_t m
   for (auto _ : state) {
     const size_t c = it++ % kRing;
     trades += AddAll(*f.book, seeds[c]);
-    f.Timed(state, cancels[c].size(), [&] { hits += CancelAll(*f.book, cancels[c]); });
+    f.Timed(state, cancels[c].size(), [&] { hits += TimedCancels(*f.book, cancels[c]); });
   }
   f.Finish(state, trades != 0 ? "seed traded"
                   : hits != kOps * state.iterations() ? "cancel hit count wrong" : "");
@@ -252,7 +262,7 @@ void BM_MatchTopOfBook(benchmark::State &state) {
   uint64_t seed_trades = 0, trades = 0;
   for (auto _ : state) {
     seed_trades += AddAll(*f.book, makers);
-    f.Timed(state, kOps, [&] { trades += AddAll(*f.book, takers); });
+    f.Timed(state, kOps, [&] { trades += TimedAdds(*f.book, takers); });
   }
   f.Finish(state, seed_trades != 0 ? "seed traded"
                   : trades != kOps * state.iterations() ? "takers did not fill exactly one maker each" : "");
@@ -282,7 +292,7 @@ void BM_Sweep10Levels(benchmark::State &state) {
   uint64_t seed_trades = 0, trades = 0;
   for (auto _ : state) {
     seed_trades += AddAll(*f.book, makers);
-    f.Timed(state, takers.size(), [&] { trades += AddAll(*f.book, takers); });
+    f.Timed(state, takers.size(), [&] { trades += TimedAdds(*f.book, takers); });
   }
   f.Finish(state, seed_trades != 0 ? "seed traded"
                   : trades != kLevels * takers.size() * state.iterations() ? "sweeps did not take exactly 10 levels" : "");
