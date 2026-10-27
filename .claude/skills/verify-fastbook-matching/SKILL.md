@@ -1,13 +1,13 @@
 ---
 name: verify-fastbook-matching
-description: Exhaustively model-check FastBook (include/fastbook.hpp and the order table, pool and level buffer under it) against a reference price-time-priority book. Use after any change to AddOrder, CancelOrder, Match, AddInBook, OpenAddressingHashMap Insert/Find/Erase/Probe, MemPool Allocate/Release, InlineBuffer, or the Order/PriceLevel structs, or when asked to prove the book's matching, cancel, or rejection behavior.
+description: Exhaustively model-check FastBook (include/fastbook.hpp and the order index under it) against a reference price-time-priority book. Use after any change to AddOrder, CancelOrder, Match, Rest, the Ladder, the node array or level_of, CheckInvariants, OpenAddressingHashMap Insert/Find/Erase/Probe or its hashes, or the Order/PriceLevel structs, or when asked to prove the book's matching, cancel, or rejection behavior.
 ---
 
 # Verify FastBook matching
 
 ## The property
 
-**Promise:** for every sequence of `AddOrder` and `CancelOrder` calls, FastBook behaves exactly like a textbook price-time-priority book. That means the same `AddResult`, the same unfilled remainder, the same trades in the same order (price, quantity, taker, maker), the same `CancelOrder` result, and the same top of book. Its internals also stay consistent: levels sorted, FIFO order per level, `prev`/`next` links, `order_count` and `total_quantity`, the order table mapping every resting id to its pool slot (and nothing else), every table key reachable by linear probing, and the pool free list intact.
+**Promise:** for every sequence of `AddOrder` and `CancelOrder` calls, FastBook behaves exactly like a textbook price-time-priority book. That means the same `AddResult`, the same unfilled remainder, the same trades in the same order (price, quantity, taker, maker), the same `CancelOrder` result, and the same top of book. Its internals also stay consistent: `FastBook::CheckInvariants()` returns `""`, and the harness's own checks hold. Those are ladder keys sorted and encoding each level's price, FIFO order per level equal to the reference, `prev`/`next` links, `level_of` pointing back at each order's level, `order_count` and `total_quantity`, the order index mapping every resting id to its node (and nothing else), every index key reachable by linear probing from its `FibonacciHash` home, and the node and level free lists covering exactly the free slots.
 
 **Harm if broken:** a trader is filled at the wrong price or out of time priority, a cancel silently misses a live order, or the order table loses an id so a resting order can never be cancelled. Memory errors and failed `assert`s also fail the check (ASan, UBSan, and asserts are on).
 
@@ -19,16 +19,16 @@ Tool choice: no off-the-shelf verifier handles this code. CBMC's and ESBMC's C++
 
 | Config | max_orders / MaxLevels | ids (table slots) | prices | qty | Scope |
 | --- | --- | --- | --- | --- | --- |
-| `pool-2` | 2 / 2 | 3, 7, 0 (4 slots: 3 and 7 collide, 7 wraps to 0, 0's home) | 1, 2, 3 | 1, 2 | **fixpoint**, 938 states. Covers PoolFull, LevelsFull, partial fills on both sides, multi-order sweeps, id reuse, duplicates. |
-| `probe-4` | 4 / 2 | 7, 15, 0, 8 (8 slots: two collision chains crossing the wrap) | 1, 2 | 1 | **fixpoint**, 31,512 states. Covers backward-shift deletion across the wrap point with up to 4 live keys. |
-| `overflow` | 2 / 2 | 3, 7, 0 | 1, 2 | 1, `UINT32_MAX` | **bounded**: every sequence of ≤ 7 ops. A MAX-sized order partially filled by 1s yields ~4 billion distinct states, so no fixpoint exists. Covers QuantityOverflow. |
+| `pool-2` | 2 / 2 | 3, 8, 0 (4 slots; FibonacciHash homes 3, 3, 0: 8 wraps into 0's home) | 1, 2, 3 | 1, 2 | **fixpoint**, 3,752 states. Covers PoolFull, LevelsFull, partial fills on both sides, multi-order sweeps, id reuse, duplicates. |
+| `probe-4` | 4 / 2 | 8, 16, 0, 5 (8 slots; FibonacciHash homes 7, 7, 0, 0: two chains meeting across the wrap) | 1, 2 | 1 | **fixpoint**, 126,048 states. Covers backward-shift deletion across the wrap point with up to 4 live keys. |
+| `overflow` | 2 / 2 | 3, 8, 0 | 1, 2 | 1, `UINT32_MAX` | **bounded**: every sequence of ≤ 7 ops (7,840 states). A MAX-sized order partially filled by 1s yields ~4 billion distinct states, so no fixpoint exists. Covers QuantityOverflow. |
 
 ## Not covered
 
-- Larger sizes. The universe uses ≤ 4 resting orders, ≤ 2 levels per side, and ≤ 3 prices. Bugs that need, for example, 3 levels on one side plus a sweep across all of them, or a table probe chain longer than 4, are outside it.
+- Larger sizes. The universe uses ≤ 4 resting orders, ≤ 2 levels per side, and ≤ 3 prices. Bugs that need, for example, 3 levels on one side plus a sweep across all of them, a ladder binary search over more than one key, or a probe chain longer than 4, are outside it.
 - The order table when it is full or nearly full. FastBook sizes it at 2 × `max_orders`, so the book never fills it. `OpenAddressingHashMap` used on its own at full load is not checked here.
 - Quantities other than 1, 2, and `UINT32_MAX`. Order quantity 0. Price 0 or negative prices (0 is the "empty side" sentinel of `BestBid`/`BestAsk`).
-- Custom allocators (only `std::allocator`), the constructor's `max_orders` validation, `MemPool::Reset`, `InlineBuffer::emplace_back`.
+- Custom allocators (only `std::allocator`), the constructor's `max_orders` validation, `Depth`, `FindOrder`, `Stats`.
 - Concurrency. FastBook is single-threaded and this check is too.
 - The reference model is trusted. If the intended semantics change (for example, rejections should leave a partial match unapplied), change `Model` first.
 
@@ -38,7 +38,7 @@ Tool choice: no off-the-shelf verifier handles this code. CBMC's and ESBMC's C++
 .claude/skills/verify-fastbook-matching/check/run.sh
 ```
 
-It takes about 25 s and exits 0 only if every config prints `PASS`. Progress lines (`[config] depth N: ...`) go to stderr. To check a modified copy of the headers without touching `include/`, run `run.sh /path/to/include-copy`. Use `-- --state-limit N` to raise the 5,000,000-state safety cap. Hitting the cap prints `INCOMPLETE` and exits 1.
+It takes about 60 s and exits 0 only if every config prints `PASS`. Progress lines (`[config] depth N: ...`) go to stderr. To check a modified copy of the headers without touching `include/`, run `run.sh /path/to/include-copy`. Use `-- --state-limit N` to raise the 5,000,000-state safety cap. Hitting the cap prints `INCOMPLETE` and exits 1.
 
 ## Reading a result
 
@@ -52,20 +52,19 @@ It takes about 25 s and exits 0 only if every config prints `PASS`. Progress lin
 
 | Check | Covers |
 | --- | --- |
-| Observables vs `Model` | `FastBook::AddOrder`, `Match`, `AddInBook`, `CancelOrder`, `BestBid/BestAsk/BestBidQty/BestAskQty` (`include/fastbook.hpp`) |
-| Level invariants | `InlineBuffer::lower_bound`, `emplace_at`, `erase`, `back` (`include/inlinebuffer.hpp`), `PriceLevel` (`include/order.hpp`) |
-| Table invariants | `OpenAddressingHashMap::Insert`, `Find`, `Erase` (backward shift), `Probe` (`include/hashmap.hpp`) |
-| Pool invariants | `MemPool::Allocate`, `Release`, `Get` (`include/mempool.hpp`) |
+| Observables vs `Model` | `FastBook::AddOrder`, `Match`, `Rest`, `CancelOrder`, `BestBid/BestAsk/BestBidQty/BestAskQty` (`include/fastbook.hpp`) |
+| Level invariants | `FastBook::Ladder::LowerBound`, `Insert`, `Erase`, `Best`, `Unlink`, `PriceLevel` (`include/order.hpp`) |
+| Node invariants | the node array, `level_of_`, the node free list, `FreeNode` (`include/fastbook.hpp`) |
+| Index invariants | `OpenAddressingHashMap::Insert`, `Find`, `Erase` (backward shift), `Probe`, `FibonacciHash` (`include/hashmap.hpp`) |
+| Book self-check | `FastBook::CheckInvariants` is called after every transition and its message reported |
 
-The harness reads these private members by name: `FastBook::{bids_, asks_, orders_, order_table_}`, `OrderNode::{order, next, prev}`, `InlineBuffer::{data_ via operator[], size()}`, `MemPool::{pool_, capacity_, free_list_, Slot::is_free, Payload::next_free/data}`, and `OpenAddressingHashMap::{slots_, capacity_, size_, Slot::{k, v, state}}`.
+The harness reads these private members by name: `FastBook::{kNone, ladders_, nodes_, level_of_, free_node_, index_, stats_}`, `Ladder::{key, slot, levels, size, free_level}`, `Node::{next, prev, id, qty}`, and `OpenAddressingHashMap::{slots_, capacity_, size_, hash(), Slot::{k, v, state}}`. `FastBook` opens with an explicit `private:` so `#define private public` reaches its members.
 
-**Sync point:** confirmed against commit `0a4e149` plus the uncommitted working tree of 2026-10-27, with these header contents (first 12 hex digits of sha256):
+**Sync point:** confirmed against commit `d7a4ec2` plus the uncommitted FastBook rewrite working tree of 2026-10-27, with these header contents (first 12 hex digits of sha256):
 
 ```
-2597203a95c1 include/fastbook.hpp
-4dca2d3a7e59 include/hashmap.hpp
-3d11a5b849fe include/inlinebuffer.hpp
-de0c7581e729 include/mempool.hpp
+acbd4d3fe0f2 include/fastbook.hpp
+0d75095500a5 include/hashmap.hpp
 dd2e966c3bf2 include/order.hpp
 ```
 
@@ -81,4 +80,12 @@ sed -i 's/((j - h) \& mask) >= ((j - i) \& mask)/((j - h) \& mask) > ((j - i) \&
 .claude/skills/verify-fastbook-matching/check/run.sh /tmp/fb-mut   # must FAIL after 3 steps
 ```
 
-Mutants confirmed caught at the sync point: the backward-shift condition `>=` → `>` (3 steps), `Match` not clearing the new head's `prev` (3 steps), `CancelOrder` skipping `level.total_quantity -=` (3 steps), and removing `- order.quantity` from the overflow guard (2 steps, caught by `overflow` only).
+Mutants confirmed caught at the sync point, with the shortest counterexample length:
+
+- `Match` leaving an emptied level on the ladder (`break` instead of the pop): 2 steps, every config.
+- `Match` popping the ladder without freeing the level slot: 2 steps, every config.
+- `CancelOrder` skipping `level.total_quantity -=`: 3 steps, every config.
+- `CancelOrder` leaving an emptied level on the ladder: 2 steps, every config.
+- `Rest` appending new orders at the head (FIFO broken): 2 steps, every config.
+- removing `- order.quantity` from the overflow guard: 2 steps, `overflow` only.
+- the backward-shift condition `>=` → `>`: 3 steps, all three configs.

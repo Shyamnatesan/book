@@ -2,16 +2,34 @@
 
 #pragma once
 
+#include <bit>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 namespace shyamnatesan {
 
-template <typename K, typename V, typename Allocator = std::allocator<K>>
+// A hash maps a key to its home slot in a table of 2^bits slots.
+struct MaskHash {
+  template <typename K> size_t operator()(const K &k, unsigned bits) const {
+    return static_cast<size_t>(k) & ((size_t{1} << bits) - 1);
+  }
+};
+
+// Multiplicative hashing keeps the top bits of k * 2^32/phi, so ids that share
+// their low bits (strided sequences) still spread across the table.
+struct FibonacciHash {
+  size_t operator()(uint32_t k, unsigned bits) const {
+    return static_cast<size_t>((uint64_t{k * 0x9E3779B9u} << bits) >> 32);
+  }
+};
+
+template <typename K, typename V, typename Allocator = std::allocator<K>,
+          typename Hash = MaskHash>
   requires std::default_initializable<K> && std::copy_constructible<K> &&
            std::assignable_from<K &, const K &> &&
            std::equality_comparable<K> && std::default_initializable<V> &&
@@ -41,7 +59,8 @@ public:
 
   explicit OpenAddressingHashMap(size_t capacity,
                                  const Allocator &alloc = Allocator())
-      : alloc_(alloc), capacity_(check_capacity(capacity)) {
+      : alloc_(alloc), capacity_(check_capacity(capacity)),
+        bits_(static_cast<unsigned>(std::countr_zero(capacity))) {
     slots_ = SlotTraits::allocate(alloc_, capacity_);
     for (size_t i{}; i < capacity_; ++i) {
       SlotTraits::construct(alloc_, slots_ + i);
@@ -69,6 +88,7 @@ public:
 private:
   [[no_unique_address]] SlotAlloc alloc_{};
   size_t capacity_;
+  unsigned bits_;
   size_t size_{};
 
   ptr slots_{nullptr};
@@ -101,6 +121,10 @@ public:
   }
 
   V *Find(const K &k) {
+    return const_cast<V *>(std::as_const(*this).Find(k));
+  }
+
+  const V *Find(const K &k) const {
     if (size_ == 0) {
       return nullptr;
     }
@@ -111,6 +135,8 @@ public:
 
     return &(slots_ + static_cast<size_t>(idx))->v;
   }
+
+  size_t Size() const { return size_; }
 
   // Backward-shift deletion: no tombstones. Pointers returned by Find are
   // invalidated by an Erase of a different key (entries may be moved).
@@ -152,9 +178,7 @@ private:
     return capacity;
   }
 
-  size_t hash(const K &k) const {
-    return static_cast<size_t>(k) & (capacity_ - 1);
-  }
+  size_t hash(const K &k) const { return Hash{}(k, bits_); }
 
   size_t Probe(const K &k) const {
     size_t idx = hash(k);

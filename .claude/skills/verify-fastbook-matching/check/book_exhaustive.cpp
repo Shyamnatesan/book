@@ -5,14 +5,18 @@
 // 1 and UINT32_MAX), until no new state appears. At every transition it checks:
 //   * observables equal the reference book: AddResult, unfilled remainder,
 //     the exact trade sequence, CancelOrder's result, BestBid/Ask/Qty;
-//   * internal invariants: level order, per-level FIFO contents equal to the
-//     reference, linked-list links, aggregates, order table <-> pool agreement,
-//     linear-probing reachability, free-list integrity.
+//   * internal invariants: FastBook::CheckInvariants(), plus this file's own
+//     checks: ladder order and keys, per-level FIFO contents equal to the
+//     reference, linked-list links, level_of, aggregates, order index <-> node
+//     agreement, linear-probing reachability, node and level free lists.
 // Build with sanitizers and without NDEBUG so asserts and UB also fail the run.
 //
 // Private state is read through `#define private public`. Every standard header
 // the library uses is included first so the macro only touches project headers.
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <bitset>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
@@ -24,10 +28,14 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #define private public
@@ -224,107 +232,136 @@ template <size_t MaxLevels> struct Checker {
   }
 
   std::string Invariants(Book &book, const Model &model) {
-    auto &pool = book.orders_;
-    auto &table = book.order_table_;
+    if (const std::string_view broken = book.CheckInvariants(); !broken.empty())
+      return "CheckInvariants: " + std::string(broken);
+
+    constexpr uint32_t kNone = Book::kNone;
+    auto &nodes = book.nodes_;
+    auto &table = book.index_;
+    const size_t cap = nodes.size();
+    std::vector<bool> live(cap);
     size_t listed = 0;
 
     for (int s = 0; s < 2; ++s) {
       const Side side = s == 0 ? Side::Buy : Side::Sell;
-      auto &levels = s == 0 ? book.bids_ : book.asks_;
+      auto &ladder = book.ladders_[s];
       const auto &ref = s == 0 ? model.bids : model.asks;
-      const std::string sname = s == 0 ? "bids_" : "asks_";
-      if (levels.size() != ref.size())
-        return sname + " has " + std::to_string(levels.size()) + " levels, reference " +
+      const std::string sname = s == 0 ? "bids" : "asks";
+      if (ladder.size != ref.size())
+        return sname + " ladder has " + std::to_string(ladder.size) + " levels, reference " +
                std::to_string(ref.size());
-      // bids_ ascend and asks_ descend, so back() is the best price.
+      // Keys ascend toward the best on both sides: bids by price, asks by ~price.
       auto rit = ref.begin();
-      for (size_t i = 0; i < levels.size(); ++i, ++rit) {
-        const PriceLevel &lvl = levels[side == Side::Buy ? i : levels.size() - 1 - i];
+      for (size_t i = 0; i < ladder.size; ++i, ++rit) {
+        const size_t pos = side == Side::Buy ? i : ladder.size - 1 - i;
+        const uint16_t slot = ladder.slot[pos];
+        if (slot >= MaxLevels) return sname + " ladder slot out of range";
+        const PriceLevel &lvl = ladder.levels[slot];
         const std::string where = sname + " level " + std::to_string(lvl.price);
         if (lvl.price != rit->first) return sname + " out of price order";
+        if (ladder.key[pos] != (side == Side::Buy ? lvl.price : ~lvl.price))
+          return where + " ladder key does not encode its price";
         const auto &q = rit->second;
         if (lvl.order_count != q.size() || lvl.total_quantity != Model::Total(q))
           return where + " order_count/total_quantity disagree with its orders";
-        uint32_t h = lvl.orders_head, prev = kInvalidPoolIndex;
+        uint32_t h = lvl.orders_head, prev = kNone;
         for (auto &[id, qty] : q) {
-          auto *n = pool.Get(h);
-          if (n == nullptr) return where + " links to a free pool slot";
-          if (n->order.order_id != id || n->order.quantity != qty ||
-              n->order.price != lvl.price || n->order.side != side)
+          if (h >= cap || live[h]) return where + " links outside the node array or twice to a node";
+          const auto &n = nodes[h];
+          if (n.id != id || n.qty != qty)
             return where + " FIFO differs from reference at order " + std::to_string(id);
-          if (n->prev != prev) return where + " broken prev link at order " + std::to_string(id);
-          auto *slot = table.Find(id);
-          if (slot == nullptr || *slot != h)
-            return "order table does not map id " + std::to_string(id) + " to its pool handle";
+          if (n.prev != prev) return where + " broken prev link at order " + std::to_string(id);
+          if (book.level_of_[h] != static_cast<uint16_t>(s << 15 | slot))
+            return where + " level_of of order " + std::to_string(id) + " does not point at it";
+          const uint32_t *mapped = table.Find(id);
+          if (mapped == nullptr || *mapped != h)
+            return "order index does not map id " + std::to_string(id) + " to its node";
+          live[h] = true;
           prev = h;
-          h = static_cast<uint32_t>(n->next);
+          h = n.next;
           ++listed;
         }
-        if (h != kInvalidPoolIndex || lvl.orders_tail != prev)
+        if (h != kNone || lvl.orders_tail != prev)
           return where + " list does not end at orders_tail";
       }
+
+      std::vector<bool> used(MaxLevels);
+      for (size_t pos = 0; pos < ladder.size; ++pos) used[ladder.slot[pos]] = true;
+      size_t free_levels = 0;
+      for (uint32_t f = ladder.free_level; f != kNone; f = ladder.levels[f].orders_head) {
+        if (f >= MaxLevels || used[f]) return sname + " level free list is corrupt";
+        used[f] = true;
+        ++free_levels;
+      }
+      if (free_levels + ladder.size != MaxLevels) return sname + " level free list misses free slots";
     }
 
-    size_t live = 0;
-    for (size_t i = 0; i < pool.capacity_; ++i) live += !pool.pool_[i].is_free;
-    if (live != listed)
-      return "pool has " + std::to_string(live) + " live slots but levels list " +
-             std::to_string(listed);
     size_t free_walk = 0;
-    for (size_t f = pool.free_list_; f != kInvalidPoolIndex; f = pool.pool_[f].payload.next_free)
-      if (f >= pool.capacity_ || !pool.pool_[f].is_free || ++free_walk > pool.capacity_)
-        return "pool free list is corrupt";
-    if (free_walk + live != pool.capacity_) return "pool free list misses free slots";
+    for (uint32_t f = book.free_node_; f != kNone; f = nodes[f].next) {
+      if (f >= cap || live[f] || ++free_walk > cap) return "node free list is corrupt";
+    }
+    if (free_walk + listed != cap) return "node free list misses free nodes";
 
     if (table.size_ != listed)
-      return "order table size_ " + std::to_string(table.size_) + " but " +
+      return "order index size_ " + std::to_string(table.size_) + " but " +
              std::to_string(listed) + " orders rest";
     using SlotState = std::remove_cvref_t<decltype(table.slots_[0].state)>;
-    const size_t cap = table.capacity_, mask = cap - 1;
+    const size_t tcap = table.capacity_, mask = tcap - 1;
     size_t table_live = 0;
-    for (size_t i = 0; i < cap; ++i) {
+    for (size_t i = 0; i < tcap; ++i) {
       auto &sl = table.slots_[i];
       if (sl.state != SlotState::Live) continue;
       ++table_live;
       // Linear probing: every slot from the key's home up to i must be Live.
-      for (size_t j = sl.k & mask; j != i; j = (j + 1) & mask)
+      for (size_t j = table.hash(sl.k); j != i; j = (j + 1) & mask)
         if (table.slots_[j].state != SlotState::Live)
-          return "order table key " + std::to_string(sl.k) +
+          return "order index key " + std::to_string(sl.k) +
                  " is unreachable: Empty slot between its home and its slot";
-      auto *n = pool.Get(sl.v);
-      if (n == nullptr || n->order.order_id != sl.k)
-        return "order table maps id " + std::to_string(sl.k) + " to the wrong pool slot";
+      if (sl.v >= cap || !live[sl.v] || nodes[sl.v].id != sl.k)
+        return "order index maps id " + std::to_string(sl.k) + " to the wrong node";
     }
-    if (table_live != listed) return "order table holds stale ids";
+    if (table_live != listed) return "order index holds stale ids";
     return "";
   }
 
   // Byte image of every field that affects future behavior, plus the model.
+  // Stats are counters only and never read back, so they are left out.
   std::string Snapshot(Book &book, const Model &model) {
+    constexpr uint32_t kNone = Book::kNone;
     std::string s;
     auto put = [&](const auto &v) { s.append(reinterpret_cast<const char *>(&v), sizeof v); };
-    for (auto *levels : {&book.bids_, &book.asks_}) {
-      put(levels->size());
-      for (size_t i = 0; i < levels->size(); ++i) {
-        const PriceLevel &l = (*levels)[i];
-        put(l.price); put(l.total_quantity); put(l.order_count);
-        put(l.orders_head); put(l.orders_tail);
+    for (auto &ladder : book.ladders_) {
+      put(ladder.size);
+      put(ladder.free_level);
+      std::vector<bool> used(MaxLevels);
+      for (size_t pos = 0; pos < ladder.size; ++pos) {
+        put(ladder.key[pos]);
+        put(ladder.slot[pos]);
+        used[ladder.slot[pos]] = true;
+      }
+      for (size_t i = 0; i < MaxLevels; ++i) {
+        const PriceLevel &l = ladder.levels[i];
+        if (used[i]) {
+          put(l.price); put(l.total_quantity); put(l.order_count);
+          put(l.orders_head); put(l.orders_tail);
+        } else {
+          put(l.orders_head);
+        }
       }
     }
-    auto &pool = book.orders_;
-    put(pool.free_list_);
-    for (size_t i = 0; i < pool.capacity_; ++i) {
-      auto &sl = pool.pool_[i];
-      put(sl.is_free);
-      if (sl.is_free) {
-        put(sl.payload.next_free);
-      } else {
-        auto &n = sl.payload.data;
-        put(n.order.price); put(n.order.order_id); put(n.order.quantity);
-        put(n.order.side); put(n.next); put(n.prev);
+    auto &nodes = book.nodes_;
+    std::vector<bool> free_node(nodes.size());
+    for (uint32_t f = book.free_node_; f != kNone && !free_node[f]; f = nodes[f].next)
+      free_node[f] = true;
+    put(book.free_node_);
+    for (size_t h = 0; h < nodes.size(); ++h) {
+      const auto &n = nodes[h];
+      put(n.next);
+      if (!free_node[h]) {
+        put(n.prev); put(n.id); put(n.qty); put(book.level_of_[h]);
       }
     }
-    auto &table = book.order_table_;
+    auto &table = book.index_;
     using SlotState = std::remove_cvref_t<decltype(table.slots_[0].state)>;
     put(table.size_);
     for (size_t i = 0; i < table.capacity_; ++i) {
@@ -352,17 +389,17 @@ template <size_t MaxLevels> struct Checker {
       std::printf("  %2zu. %s\n", i + 1, OpStr(path[i]).c_str());
   }
 
-  // FastBook is not copyable; copy every field Snapshot covers. Pool slots hold
-  // a union with a user-declared destructor, so they are copied bytewise.
+  // FastBook is not copyable (the order index owns raw slots); copy every
+  // field Snapshot covers.
   static void CopyInto(Book &dst, Book &src) {
-    dst.bids_ = src.bids_;
-    dst.asks_ = src.asks_;
-    std::memcpy(static_cast<void *>(dst.orders_.pool_), src.orders_.pool_,
-                src.orders_.capacity_ * sizeof(*src.orders_.pool_));
-    dst.orders_.free_list_ = src.orders_.free_list_;
-    std::memcpy(static_cast<void *>(dst.order_table_.slots_), src.order_table_.slots_,
-                src.order_table_.capacity_ * sizeof(*src.order_table_.slots_));
-    dst.order_table_.size_ = src.order_table_.size_;
+    dst.ladders_ = src.ladders_;
+    dst.nodes_ = src.nodes_;
+    dst.level_of_ = src.level_of_;
+    dst.free_node_ = src.free_node_;
+    std::memcpy(static_cast<void *>(dst.index_.slots_), src.index_.slots_,
+                src.index_.capacity_ * sizeof(*src.index_.slots_));
+    dst.index_.size_ = src.index_.size_;
+    dst.stats_ = src.stats_;
   }
 
   bool Run(size_t state_limit) {
@@ -445,26 +482,27 @@ int main(int argc, char **argv) {
   // Quantities {1, 2} cover taker and maker partial fills and multi-order
   // sweeps while keeping the state space finite, so these two run to fixpoint.
   //
-  // pool-2: order table has 4 slots (mask 3): ids 3 and 7 share home slot 3, so
-  // 7 wraps to slot 0, which is id 0's home. The pool holds 2 orders, so a
-  // third resting order is PoolFull; 3 prices on one side hit LevelsFull.
+  // pool-2: order index has 4 slots. Under FibonacciHash ids 3 and 8 share
+  // home 3, so 8 wraps to slot 0, which is id 0's home. The book holds 2
+  // orders, so a third resting order is PoolFull; 3 prices on one side hit
+  // LevelsFull.
   {
-    Checker<2> c{"pool-2", 2, 0, Alphabet({3, 7, 0}, {1, 2, 3}, {1, 2}), {}};
+    Checker<2> c{"pool-2", 2, 0, Alphabet({3, 8, 0}, {1, 2, 3}, {1, 2}), {}};
     ok &= c.Run(state_limit);
   }
-  // probe-4: order table has 8 slots (mask 7): 7 and 15 share home 7, 0 and 8
-  // share home 0, so probe chains cross the wrap point and backward-shift
-  // deletion moves entries across it. Partial fills and LevelsFull are left to
-  // pool-2 to keep this space small.
+  // probe-4: order index has 8 slots. Under FibonacciHash 8 and 16 share home
+  // 7 and wrap to slot 0, the home of 0 and 5, so probe chains cross the wrap
+  // point and backward-shift deletion moves entries across it. Partial fills
+  // and LevelsFull are left to pool-2 to keep this space small.
   {
-    Checker<2> c{"probe-4", 4, 0, Alphabet({7, 15, 0, 8}, {1, 2}, {1}), {}};
+    Checker<2> c{"probe-4", 4, 0, Alphabet({8, 16, 0, 5}, {1, 2}, {1}), {}};
     ok &= c.Run(state_limit);
   }
   // overflow: UINT32_MAX makes level totals wrap-adjacent (QuantityOverflow),
   // but each partial fill of a MAX order is a new state, so no fixpoint
   // exists. This one is bounded by sequence length.
   {
-    Checker<2> c{"overflow", 2, 7, Alphabet({3, 7, 0}, {1, 2}, {1, kMaxQty}), {}};
+    Checker<2> c{"overflow", 2, 7, Alphabet({3, 8, 0}, {1, 2}, {1, kMaxQty}), {}};
     ok &= c.Run(state_limit);
   }
   return ok ? 0 : 1;
