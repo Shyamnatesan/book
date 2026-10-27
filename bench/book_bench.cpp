@@ -116,7 +116,7 @@ struct Fixture {
   }
 };
 
-uint64_t AddAll(Book &b, const std::vector<Order> &orders) {
+[[gnu::always_inline]] inline uint64_t AddAll(Book &b, const std::vector<Order> &orders) {
   uint64_t trades = 0;
   for (const Order &src : orders) {
     Order o = src;
@@ -125,7 +125,7 @@ uint64_t AddAll(Book &b, const std::vector<Order> &orders) {
   return trades;
 }
 
-uint64_t CancelAll(Book &b, const std::vector<OrderId> &ids) {
+[[gnu::always_inline]] inline uint64_t CancelAll(Book &b, const std::vector<OrderId> &ids) {
   uint64_t hits = 0;
   for (OrderId id : ids) hits += b.CancelOrder(id);
   return hits;
