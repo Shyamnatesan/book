@@ -104,8 +104,11 @@ private:
       assert(size < MaxLevels && free_level != kNone && pos <= size);
       const auto s = static_cast<uint16_t>(free_level);
       free_level = levels[s].orders_head;
-      std::copy_backward(key + pos, key + size, key + size + 1);
-      std::copy_backward(slot + pos, slot + size, slot + size + 1);
+      // A new best level appends; skipping the empty copies avoids two memmove calls.
+      if (pos != size) {
+        std::copy_backward(key + pos, key + size, key + size + 1);
+        std::copy_backward(slot + pos, slot + size, slot + size + 1);
+      }
       key[pos] = k;
       slot[pos] = s;
       ++size;
@@ -116,8 +119,10 @@ private:
     void Erase(uint32_t pos) {
       assert(pos < size);
       const uint16_t s = slot[pos];
-      std::copy(key + pos + 1, key + size, key + pos);
-      std::copy(slot + pos + 1, slot + size, slot + pos);
+      if (pos + 1 != size) {
+        std::copy(key + pos + 1, key + size, key + pos);
+        std::copy(slot + pos + 1, slot + size, slot + pos);
+      }
       --size;
       levels[s].orders_head = free_level;
       free_level = s;
