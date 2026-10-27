@@ -188,8 +188,6 @@ public:
       Match(order, on_trade);
       result = order.quantity == 0 ? AddResult::Ok : Rest(order);
     }
-    // The constant index on the common path is measurably cheaper than
-    // indexing by result (AddAtBest +3.7% otherwise).
     if (result == AddResult::Ok) [[likely]] {
       ++stats_.add_results[0];
     } else {
