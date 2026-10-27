@@ -55,16 +55,16 @@ It takes about 60 s and exits 0 only if every config prints `PASS`. Progress lin
 | Observables vs `Model` | `FastBook::AddOrder`, `Match`, `Rest`, `CancelOrder`, `BestBid/BestAsk/BestBidQty/BestAskQty` (`include/fastbook.hpp`) |
 | Level invariants | `FastBook::Ladder::LowerBound`, `Insert`, `Erase`, `Best`, `Unlink`, `PriceLevel` (`include/order.hpp`) |
 | Node invariants | the node array, `level_of_`, the node free list, `FreeNode` (`include/fastbook.hpp`) |
-| Index invariants | `OpenAddressingHashMap::Insert`, `Find`, `Erase` (backward shift), `Probe`, `FibonacciHash` (`include/hashmap.hpp`) |
+| Index invariants | `OpenAddressingHashMap::Insert`, `Find`, `Erase` and `ShiftBack` (backward shift), `Probe`, `FibonacciHash` (`include/hashmap.hpp`) |
 | Book self-check | `FastBook::CheckInvariants` is called after every transition and its message reported |
 
 The harness reads these private members by name: `FastBook::{kNone, ladders_, nodes_, level_of_, free_node_, index_, stats_}`, `Ladder::{key, slot, levels, size, free_level}`, `Node::{next, prev, id, qty}`, and `OpenAddressingHashMap::{slots_, capacity_, size_, hash(), Slot::{k, v, state}}`. `FastBook` opens with an explicit `private:` so `#define private public` reaches its members.
 
-**Sync point:** confirmed against commit `797055f` (code identical to `1e1b85e`; a comment was removed), with these header contents (first 12 hex digits of sha256):
+**Sync point:** confirmed against commit `2f85f5c`, with these header contents (first 12 hex digits of sha256):
 
 ```
-47ddd4fc675b include/fastbook.hpp
-0d75095500a5 include/hashmap.hpp
+9936d62c5b77 include/fastbook.hpp
+4bb5ccf3c35c include/hashmap.hpp
 dd2e966c3bf2 include/order.hpp
 ```
 
@@ -89,3 +89,5 @@ Mutants confirmed caught at the sync point, with the shortest counterexample len
 - `Rest` appending new orders at the head (FIFO broken): 2 steps, every config.
 - removing `- order.quantity` from the overflow guard: 2 steps, `overflow` only.
 - the backward-shift condition `>=` → `>`: 3 steps, all three configs.
+- `Match` popping a filled head without clearing its successor's `prev`: 3 steps, all three configs.
+- `Crosses` using `<` (a taker at exactly the best opposite price rests instead of trading): 2 steps, all three configs.
